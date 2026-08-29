@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.pyc
+*.db
+uploads/
+outputs/
+reasoning_log.json
+*.log
+node_modules/
+temp_data.db
+test_*.csv
+cleaned_*.csv
+server_output*.log
+reasoning_log.json
+uploads/
+__pycache__/
+chart_*.png

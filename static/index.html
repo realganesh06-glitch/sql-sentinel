@@ -1,0 +1,1178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SQLsentinel — data analyst</title>
+
+<!--
+  SQLsentinel — front-end for the SQL data-analyst agent.
+  Designed to be SERVED BY the FastAPI app so it shares the same origin
+  (http://localhost:8000). That means all calls below are relative and need no CORS.
+
+  Endpoints it talks to (from the agent we built):
+    POST /upload   -> multipart form, field name "file"   -> returns { file_id, schema, ... }
+    POST /ask      -> JSON { file_id, question, use_cleaned, chart_theme, chart_type, custom_colors }
+                      -> returns { summary, table, chart_url, sql_used, chart_type_used,
+                                   chart_theme_used, custom_colors_used, warning, error, outcome }
+    GET  /charts/{file}  -> the chart PNG (chart_url points here)
+    GET  /health         -> { status: "ok" }
+
+  Preview the DESIGN without a backend: open this file with ?demo=1 on the URL.
+-->
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<style>
+  :root{
+    color-scheme: light;
+
+    /* palette — cool paper "graph pad" + slate ink + emerald-teal accent */
+    --paper:#EEF2F7;
+    --surface:#FFFFFF;
+    --surface-2:#F6F9FC;
+    --ink:#14202C;
+    --ink-2:#47566A;
+    --ink-3:#8A97A6;
+    --line:#E1E7EF;
+    --line-2:#CDD6E0;
+    --accent:#0E7C66;
+    --accent-strong:#0A5F4E;
+    --accent-wash:#E4F1ED;
+    --ring:rgba(14,124,102,.30);
+    --danger:#C0432F;
+    --danger-wash:#FBECE9;
+    --warn:#9A6400;
+    --warn-wash:#FBF1DE;
+    --grid:rgba(20,32,44,.038);
+
+    --font-display:'Space Grotesk', system-ui, sans-serif;
+    --font-sans:'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+    --font-mono:'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+    --r:14px;
+    --r-sm:9px;
+    --shadow:0 1px 2px rgba(20,32,44,.05), 0 14px 34px -18px rgba(20,32,44,.20);
+    --shadow-sm:0 1px 2px rgba(20,32,44,.06);
+  }
+
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    font-family:var(--font-sans);
+    color:var(--ink);
+    background-color:var(--paper);
+    background-image:
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size:28px 28px;
+    -webkit-font-smoothing:antialiased;
+    line-height:1.5;
+    min-height:100vh;
+  }
+  a{color:inherit;}
+  button{font-family:inherit;cursor:pointer;}
+  ::selection{background:var(--accent-wash);}
+
+  /* ---------- top bar ---------- */
+  .topbar{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:18px 30px;
+    border-bottom:1px solid var(--line);
+    background:rgba(255,255,255,.72);
+    backdrop-filter:blur(8px);
+    position:sticky;top:0;z-index:20;
+  }
+  .brand{display:flex;align-items:center;gap:12px;}
+  .brand .mark{width:34px;height:34px;flex:none;}
+  .brand .name{font-family:var(--font-display);font-weight:700;font-size:20px;letter-spacing:-.01em;}
+  .brand .name .sql-mark{color:var(--accent-strong);}
+  .brand .kicker{
+    font-family:var(--font-mono);font-size:11px;letter-spacing:.16em;
+    text-transform:uppercase;color:var(--ink-3);margin-top:1px;
+  }
+  .status{
+    display:flex;align-items:center;gap:8px;
+    font-family:var(--font-mono);font-size:12px;color:var(--ink-2);
+    padding:6px 12px;border:1px solid var(--line);border-radius:999px;background:var(--surface);
+  }
+  .status .dot{width:8px;height:8px;border-radius:50%;background:var(--ink-3);}
+  .status .dot.on{background:var(--accent);box-shadow:0 0 0 4px var(--accent-wash);}
+  .status .dot.off{background:var(--danger);box-shadow:0 0 0 4px var(--danger-wash);}
+
+  /* ---------- workspace grid ---------- */
+  .workspace{
+    display:grid;grid-template-columns:314px minmax(0,1fr);
+    gap:26px;max-width:1240px;margin:0 auto;padding:26px 30px 80px;
+    align-items:start;
+  }
+  @media (max-width:880px){
+    .workspace{grid-template-columns:1fr;}
+  }
+
+  .panel{
+    background:var(--surface);border:1px solid var(--line);border-radius:var(--r);
+    box-shadow:var(--shadow-sm);
+  }
+  .panel-head{
+    display:flex;align-items:baseline;justify-content:space-between;
+    padding:16px 18px 12px;
+  }
+  .panel-head h2{
+    margin:0;font-family:var(--font-display);font-weight:600;font-size:14px;
+    letter-spacing:.02em;
+  }
+  .panel-head .tag{font-family:var(--font-mono);font-size:11px;color:var(--ink-3);}
+
+  /* ---------- data / side panel ---------- */
+  .aside{position:sticky;top:92px;display:flex;flex-direction:column;gap:18px;}
+  @media (max-width:880px){ .aside{position:static;} }
+
+  .dropzone{
+    margin:0 14px 16px;padding:22px 16px;border:1.5px dashed var(--line-2);
+    border-radius:var(--r-sm);text-align:center;background:var(--surface-2);
+    transition:border-color .18s, background .18s;
+  }
+  .dropzone.drag{border-color:var(--accent);background:var(--accent-wash);}
+  .dropzone .dz-title{font-weight:600;font-size:14px;}
+  .dropzone .dz-sub{font-size:12.5px;color:var(--ink-2);margin-top:4px;}
+  .dropzone .browse{color:var(--accent-strong);font-weight:600;text-decoration:underline;text-underline-offset:2px;}
+  .dz-icon{margin:0 auto 10px;width:30px;height:30px;color:var(--ink-3);}
+
+  .filecard{margin:0 14px 14px;display:none;}
+  .filecard.show{display:block;}
+  .filerow{display:flex;align-items:center;gap:10px;padding:11px 12px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--surface-2);}
+  .filerow .fi{width:22px;height:22px;color:var(--accent);flex:none;}
+  .filerow .fname{font-family:var(--font-mono);font-size:12.5px;font-weight:500;word-break:break-all;line-height:1.35;}
+  .filerow .fmeta{font-size:11.5px;color:var(--ink-2);margin-top:1px;}
+  .filerow .fclose{margin-left:auto;border:none;background:none;color:var(--ink-3);font-size:18px;line-height:1;padding:2px 4px;border-radius:6px;}
+  .filerow .fclose:hover{background:var(--paper);color:var(--ink);}
+
+  .schema{padding:0 14px 6px;}
+  .schema .sh-label{font-family:var(--font-mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);margin:2px 0 9px;}
+  .chips{display:flex;flex-wrap:wrap;gap:7px;}
+  .chip{
+    display:inline-flex;align-items:center;gap:6px;
+    font-family:var(--font-mono);font-size:12px;
+    padding:4px 9px;border:1px solid var(--line);border-radius:999px;background:var(--surface);color:var(--ink);
+  }
+  .chip .g{font-size:10px;font-weight:500;color:var(--accent-strong);background:var(--accent-wash);border-radius:5px;padding:1px 4px;line-height:1.3;}
+  .chip.txt .g{color:var(--ink-2);background:var(--paper);}
+
+  .cleaned{display:flex;align-items:center;gap:10px;padding:12px 2px 2px;margin-top:12px;}
+  .switch{position:relative;width:38px;height:22px;flex:none;}
+  .switch input{opacity:0;width:0;height:0;position:absolute;}
+  .switch .track{position:absolute;inset:0;background:var(--line-2);border-radius:999px;transition:background .18s;}
+  .switch .thumb{position:absolute;top:2px;left:2px;width:18px;height:18px;background:#fff;border-radius:50%;box-shadow:var(--shadow-sm);transition:transform .18s;}
+  .switch input:checked + .track{background:var(--accent);}
+  .switch input:checked + .track + .thumb{transform:translateX(16px);}
+  .switch input:focus-visible + .track{box-shadow:0 0 0 3px var(--ring);}
+  .cleaned .cl-txt .t{font-size:13px;font-weight:500;}
+  .cleaned .cl-txt .s{font-size:11.5px;color:var(--ink-2);}
+
+  .quality{padding:12px 16px 16px;border-top:1px solid var(--line);margin-top:6px;}
+  .cleanbtn{
+    display:inline-flex;align-items:center;gap:8px;width:100%;justify-content:center;
+    padding:9px 12px;border:1px solid var(--accent);color:var(--accent-strong);background:var(--surface);
+    border-radius:var(--r-sm);font-size:13px;font-weight:600;transition:background .15s;
+  }
+  .cleanbtn:hover:not(:disabled){background:var(--accent-wash);}
+  .cleanbtn:disabled{opacity:.65;cursor:default;border-color:var(--line-2);color:var(--ink-3);}
+  .cleanbtn .ci{width:15px;height:15px;}
+  .cleanbtn .spin{width:14px;height:14px;border:2px solid var(--accent-wash);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;display:none;}
+  .cleanbtn.loading .spin{display:inline-block;}
+  .cleanbtn.loading .ci{display:none;}
+  .clean-summary{margin-top:12px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--surface-2);padding:12px 13px;display:none;}
+  .clean-summary.show{display:block;}
+  .clean-summary .cs-head{display:flex;align-items:center;gap:7px;font-size:12.5px;font-weight:600;color:var(--accent-strong);margin-bottom:9px;}
+  .clean-summary ul{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:7px;}
+  .clean-summary li{font-size:12.5px;color:var(--ink-2);display:flex;gap:8px;line-height:1.4;}
+  .clean-summary li::before{content:"";flex:none;width:5px;height:5px;border-radius:50%;background:var(--accent);margin-top:6px;}
+  .clean-summary .cs-orig{font-size:11.5px;color:var(--ink-3);margin-top:9px;}
+
+  /* ---------- main column ---------- */
+  .main{display:flex;flex-direction:column;gap:26px;min-width:0;}
+
+  .hero{padding:30px 28px 26px;}
+  .hero h1{
+    font-family:var(--font-display);font-weight:700;font-size:clamp(28px,4vw,40px);
+    letter-spacing:-.02em;margin:0 0 8px;line-height:1.04;
+  }
+  .hero h1 .accent{color:var(--accent);}
+  .hero .lede{font-size:15px;color:var(--ink-2);max-width:56ch;margin:0 0 22px;}
+
+  .askform{display:flex;flex-direction:column;gap:14px;}
+  .qwrap{position:relative;}
+  .qinput{
+    width:100%;resize:vertical;min-height:64px;
+    font-family:var(--font-sans);font-size:16.5px;color:var(--ink);
+    padding:16px 18px;border:1.5px solid var(--line-2);border-radius:var(--r-sm);
+    background:var(--surface);transition:border-color .16s, box-shadow .16s;
+  }
+  .qinput::placeholder{color:var(--ink-3);}
+  .qinput:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 4px var(--ring);}
+
+  .controls{display:flex;flex-wrap:wrap;align-items:flex-end;gap:18px 22px;}
+  .ctrl{display:flex;flex-direction:column;gap:7px;}
+  .ctrl > .lbl{font-family:var(--font-mono);font-size:11px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-3);}
+
+  /* segmented control */
+  .segmented{display:inline-flex;border:1px solid var(--line-2);border-radius:var(--r-sm);overflow:hidden;background:var(--surface);}
+  .segmented label{position:relative;}
+  .segmented input{position:absolute;opacity:0;inset:0;cursor:pointer;}
+  .segmented .seg{display:block;padding:8px 13px;font-size:13px;font-weight:500;color:var(--ink-2);border-right:1px solid var(--line);transition:color .15s, background .15s;}
+  .segmented label:last-child .seg{border-right:none;}
+  .segmented input:checked + .seg{background:var(--accent);color:#fff;}
+  .segmented input:focus-visible + .seg{box-shadow:inset 0 0 0 2px var(--ring);}
+
+  .select{
+    appearance:none;font-family:var(--font-sans);font-size:13.5px;color:var(--ink);
+    padding:9px 34px 9px 13px;border:1px solid var(--line-2);border-radius:var(--r-sm);background:var(--surface);
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path d='M2 4l4 4 4-4' stroke='%2347566A' stroke-width='1.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-repeat:no-repeat;background-position:right 12px center;
+  }
+  .select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--ring);}
+
+  /* custom colors */
+  .colors{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+  .swatch{position:relative;width:30px;height:30px;border-radius:8px;border:1px solid var(--line-2);overflow:hidden;padding:0;}
+  .swatch input[type=color]{position:absolute;inset:-6px;width:calc(100% + 12px);height:calc(100% + 12px);border:none;padding:0;background:none;cursor:pointer;}
+  .swatch .x{position:absolute;top:-6px;right:-6px;width:16px;height:16px;border-radius:50%;background:var(--ink);color:#fff;font-size:11px;line-height:16px;text-align:center;border:2px solid var(--surface);opacity:0;transition:opacity .15s;}
+  .swatch:hover .x{opacity:1;}
+  .addcolor,.linkbtn{
+    border:1px dashed var(--line-2);background:var(--surface);color:var(--ink-2);
+    width:30px;height:30px;border-radius:8px;font-size:18px;line-height:1;display:inline-flex;align-items:center;justify-content:center;
+  }
+  .addcolor:hover{border-color:var(--accent);color:var(--accent);}
+  .linkbtn{width:auto;padding:0 10px;height:26px;border-style:solid;border-radius:999px;font-size:12px;font-family:var(--font-mono);}
+  .linkbtn:hover{border-color:var(--accent);color:var(--accent);}
+  .colors-note{font-size:12.5px;color:var(--ink-3);font-family:var(--font-mono);}
+
+  .askbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;}
+  .ask{
+    display:inline-flex;align-items:center;gap:9px;
+    background:var(--accent);color:#fff;border:none;border-radius:var(--r-sm);
+    font-size:15px;font-weight:600;padding:13px 22px;box-shadow:var(--shadow-sm);
+    transition:background .16s, transform .06s;
+  }
+  .ask:hover:not(:disabled){background:var(--accent-strong);}
+  .ask:active:not(:disabled){transform:translateY(1px);}
+  .ask:disabled{background:var(--line-2);color:#fff;cursor:not-allowed;}
+  .ask .spin{width:16px;height:16px;border:2px solid rgba(255,255,255,.45);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;display:none;}
+  .ask.loading .spin{display:inline-block;}
+  .ask.loading .ask-arrow{display:none;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+  .hint{font-size:13px;color:var(--ink-3);}
+
+  .examples{display:flex;flex-wrap:wrap;gap:8px;margin-top:2px;}
+  .ex{
+    font-size:12.5px;color:var(--ink-2);background:var(--surface);border:1px solid var(--line);
+    padding:6px 11px;border-radius:999px;transition:border-color .15s,color .15s;
+  }
+  .ex:hover{border-color:var(--accent);color:var(--accent-strong);}
+
+  /* ---------- result ---------- */
+  .result{min-height:60px;}
+  .empty{
+    padding:40px 28px;text-align:center;color:var(--ink-3);
+    border:1px dashed var(--line-2);border-radius:var(--r);background:rgba(255,255,255,.5);
+  }
+  .empty .e-mark{width:40px;height:40px;margin:0 auto 12px;color:var(--line-2);}
+  .empty .e-title{font-family:var(--font-display);font-weight:600;font-size:16px;color:var(--ink-2);}
+  .empty .e-sub{font-size:13.5px;margin-top:4px;}
+
+  .report{
+    position:relative;background:var(--surface);border:1px solid var(--line);border-radius:var(--r);
+    box-shadow:var(--shadow);overflow:hidden;
+    animation:rise .4s cubic-bezier(.2,.7,.3,1) both;
+  }
+  @keyframes rise{from{opacity:0;transform:translateY(10px);}to{opacity:1;transform:none;}}
+
+  /* the signature "axis rail" */
+  .rail{position:absolute;top:0;left:0;bottom:0;width:34px;border-right:1px solid var(--line);background:var(--surface-2);}
+  .rail::before{content:"";position:absolute;left:16px;top:22px;bottom:22px;width:1.5px;background:var(--line-2);}
+  .rail .tick{position:absolute;left:11px;width:11px;height:1.5px;background:var(--line-2);}
+  .report-body{padding:24px 28px 26px 52px;}
+
+  .loadbar{height:2px;background:var(--accent-wash);overflow:hidden;}
+  .loadbar::after{content:"";display:block;height:100%;width:38%;background:var(--accent);animation:slide 1.15s ease-in-out infinite;}
+  @keyframes slide{0%{transform:translateX(-100%);}100%{transform:translateX(320%);}}
+
+  .r-eyebrow{font-family:var(--font-mono);font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:var(--accent-strong);margin-bottom:9px;}
+  .summary{font-size:16.5px;line-height:1.6;color:var(--ink);margin:0 0 22px;}
+
+  .figure{border:1px solid var(--line);border-radius:var(--r-sm);overflow:hidden;background:var(--surface-2);margin-bottom:22px;}
+  .figure img{display:block;width:100%;height:auto;}
+  .figcap{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 12px;border-top:1px solid var(--line);font-family:var(--font-mono);font-size:11.5px;color:var(--ink-2);}
+  .pill{background:var(--paper);border:1px solid var(--line);border-radius:999px;padding:2px 9px;}
+  .pill.on{background:var(--accent-wash);border-color:transparent;color:var(--accent-strong);}
+
+  .tbl-wrap{border:1px solid var(--line);border-radius:var(--r-sm);overflow:auto;max-height:360px;}
+  table{border-collapse:collapse;width:100%;font-size:13.5px;}
+  thead th{
+    position:sticky;top:0;background:var(--surface-2);text-align:left;
+    font-family:var(--font-mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-2);
+    padding:10px 14px;border-bottom:1px solid var(--line);white-space:nowrap;
+  }
+  tbody td{padding:9px 14px;border-bottom:1px solid var(--line);white-space:nowrap;}
+  tbody tr:last-child td{border-bottom:none;}
+  td.num{font-family:var(--font-mono);text-align:right;color:var(--ink);}
+
+  .disclosure{margin-top:20px;border:1px solid var(--line);border-radius:var(--r-sm);overflow:hidden;}
+  .disclosure summary{
+    list-style:none;cursor:pointer;padding:12px 15px;display:flex;align-items:center;gap:10px;
+    font-family:var(--font-mono);font-size:12.5px;color:var(--ink-2);background:var(--surface-2);
+  }
+  .disclosure summary::-webkit-details-marker{display:none;}
+  .disclosure summary .chev{transition:transform .18s;color:var(--ink-3);}
+  .disclosure[open] summary .chev{transform:rotate(90deg);}
+  .disclosure .body{padding:0 15px 15px;}
+  pre.sql{
+    margin:14px 0 0;padding:15px 16px;background:#0F1922;color:#D7E2EC;border-radius:var(--r-sm);
+    font-family:var(--font-mono);font-size:12.5px;line-height:1.6;overflow:auto;white-space:pre-wrap;word-break:break-word;
+  }
+  pre.sql .kw{color:#5FD0AE;font-weight:500;}
+  .meta-grid{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px;}
+
+  .notice{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border-radius:var(--r-sm);font-size:13.5px;margin-bottom:20px;}
+  .notice.warn{background:var(--warn-wash);color:var(--warn);}
+  .notice.err{background:var(--danger-wash);color:var(--danger);}
+  .notice .ni{flex:none;margin-top:1px;}
+  .notice .nt{font-weight:600;}
+
+  .footer{max-width:1240px;margin:0 auto;padding:0 30px 40px;color:var(--ink-3);font-size:12px;font-family:var(--font-mono);}
+
+  @media (prefers-reduced-motion:reduce){
+    *{animation:none !important;transition:none !important;}
+  }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <!-- logo mark: a plot frame with a rising data point on an axis -->
+    <svg class="mark" viewBox="0 0 34 34" fill="none" aria-hidden="true">
+      <rect x="1.5" y="1.5" width="31" height="31" rx="9" fill="#E4F1ED" stroke="#0E7C66" stroke-width="1.5"/>
+      <path d="M8 24 L8 10" stroke="#0A5F4E" stroke-width="1.6" stroke-linecap="round"/>
+      <path d="M8 24 L26 24" stroke="#0A5F4E" stroke-width="1.6" stroke-linecap="round"/>
+      <path d="M9 21 L15 16 L20 18 L26 9" stroke="#0E7C66" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="26" cy="9" r="2.7" fill="#0E7C66"/>
+    </svg>
+    <div>
+      <div class="name"><span class="sql-mark">SQL</span>sentinel</div>
+      <div class="kicker">data analyst</div>
+    </div>
+  </div>
+  <div class="status" id="status" aria-live="polite">
+    <span class="dot" id="statusDot"></span>
+    <span id="statusText">checking…</span>
+  </div>
+</header>
+
+<main class="workspace">
+
+  <!-- ---------- left: your data ---------- -->
+  <aside class="aside">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Your data</h2>
+        <span class="tag" id="dataTag">no file</span>
+      </div>
+
+      <div class="dropzone" id="dropzone">
+        <svg class="dz-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M12 16V4m0 0L8 8m4-4l4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
+        <div class="dz-title">Add your data</div>
+        <div class="dz-sub">Drop a CSV, Excel, or database file, or <span class="browse">browse</span>.</div>
+        <input type="file" id="fileInput" accept=".csv,.tsv,.xlsx,.xls,.db,.sqlite,.sqlite3" hidden />
+      </div>
+
+      <div class="filecard" id="fileCard">
+        <div class="filerow">
+          <svg class="fi" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M13 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V9l-6-6z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+            <path d="M13 3v6h6" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+          </svg>
+          <div>
+            <div class="fname" id="fileName">—</div>
+            <div class="fmeta" id="fileMeta"></div>
+          </div>
+          <button class="fclose" id="fileClear" title="Remove file" aria-label="Remove file">×</button>
+        </div>
+
+        <div class="schema" id="schemaWrap" style="display:none;">
+          <div class="sh-label">Columns detected</div>
+          <div class="chips" id="chips"></div>
+        </div>
+
+        <div class="quality" id="qualityWrap" style="display:none;">
+          <button class="cleanbtn" id="cleanBtn">
+            <span class="spin"></span>
+            <svg class="ci" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 12a8 8 0 018-8 8 8 0 016.9 4M20 12a8 8 0 01-8 8 8 8 0 01-6.9-4M18 4v4h-4M6 20v-4h4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span class="cb-label">Clean my data</span>
+          </button>
+          <div class="clean-summary" id="cleanSummary"></div>
+          <label class="cleaned" id="cleanedWrap" style="display:none;">
+            <span class="switch">
+              <input type="checkbox" id="useCleaned" />
+              <span class="track"></span><span class="thumb"></span>
+            </span>
+            <span class="cl-txt">
+              <span class="t">Use cleaned data</span>
+              <span class="s">Analyze the cleaned copy</span>
+            </span>
+          </label>
+          <button class="cleanbtn" id="downloadBtn" style="display:none;margin-top:10px;">
+            <svg class="ci" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 20h14" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span class="dl-label">Download cleaned data</span>
+          </button>
+        </div>
+      </div>
+    </section>
+  </aside>
+
+  <!-- ---------- right: ask + result ---------- -->
+  <div class="main">
+
+    <section class="panel hero">
+      <h1>Ask your <span class="accent">data.</span></h1>
+      <p class="lede">Type a question in plain English. SQLsentinel writes the SQL, runs it against your file, and shows you the answer with a chart you can style.</p>
+
+      <div class="askform">
+        <div class="qwrap">
+          <textarea class="qinput" id="question" rows="2"
+            placeholder="e.g. What is the total revenue by product category?"></textarea>
+        </div>
+
+        <div class="controls">
+          <div class="ctrl">
+            <span class="lbl">Chart</span>
+            <div class="segmented" id="chartType" role="radiogroup" aria-label="Chart type">
+              <label><input type="radio" name="ctype" value="auto" checked /><span class="seg">Auto</span></label>
+              <label><input type="radio" name="ctype" value="bar" /><span class="seg">Bar</span></label>
+              <label><input type="radio" name="ctype" value="pie" /><span class="seg">Pie</span></label>
+              <label><input type="radio" name="ctype" value="scatter" /><span class="seg">Scatter</span></label>
+            </div>
+          </div>
+
+          <div class="ctrl">
+            <span class="lbl">Theme</span>
+            <select class="select" id="theme" aria-label="Chart theme">
+              <option value="corporate">Corporate</option>
+              <option value="warm">Warm</option>
+              <option value="cool">Cool</option>
+              <option value="monochrome">Monochrome</option>
+            </select>
+          </div>
+
+          <div class="ctrl">
+            <span class="lbl">Colors</span>
+            <div class="colors" id="colors">
+              <span class="colors-note" id="colorsNote">Theme colors</span>
+              <button class="addcolor" id="addColor" title="Add a custom color" aria-label="Add a custom color">+</button>
+              <button class="linkbtn" id="resetColors" style="display:none;">reset</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="askbar">
+          <button class="ask" id="askBtn" disabled>
+            <span class="spin"></span>
+            <span class="ask-label">Ask</span>
+            <svg class="ask-arrow" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M3 8h9M9 4l4 4-4 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+          <span class="hint" id="askHint">Add a file to begin.</span>
+        </div>
+
+        <div class="examples" id="examples">
+          <button class="ex">What is the total revenue by product category?</button>
+          <button class="ex">Which 5 customers spent the most?</button>
+          <button class="ex">How do monthly sales trend over time?</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="result" id="result">
+      <div class="empty" id="emptyState">
+        <svg class="e-mark" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <rect x="3" y="3" width="18" height="18" rx="4" stroke="currentColor" stroke-width="1.4"/>
+          <path d="M7 15l3-3 2 2 4-5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <div class="e-title">Your report will appear here</div>
+        <div class="e-sub">Ask a question and SQLsentinel will plot the answer.</div>
+      </div>
+    </section>
+
+  </div>
+</main>
+
+<footer class="footer" id="footer"></footer>
+
+<script>
+"use strict";
+(function(){
+  /* ---------------- config ---------------- */
+  const API_BASE = "";                                   // "" = same origin (served by FastAPI)
+  const DEMO = new URLSearchParams(location.search).has("demo");
+
+  const el = (id) => document.getElementById(id);
+  const state = { fileId: null, customColors: [], cleaned: false };
+  const DEFAULT_EXAMPLES = (el("examples") && el("examples").innerHTML) || "";
+
+  /* ---------------- health / status ---------------- */
+  async function checkHealth(){
+    if (DEMO){ setStatus("on", "preview mode"); return; }
+    try{
+      const r = await fetch(API_BASE + "/health", { method:"GET" });
+      if (r.ok){ setStatus("on", "connected"); }
+      else { setStatus("off", "server error"); }
+    }catch(e){ setStatus("off", "offline"); }
+  }
+  function setStatus(kind, text){
+    el("statusDot").className = "dot " + kind;
+    el("statusText").textContent = text;
+  }
+
+  /* ---------------- upload ---------------- */
+  const dz = el("dropzone"), fileInput = el("fileInput");
+  dz.addEventListener("click", () => fileInput.click());
+  dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.classList.add("drag"); });
+  dz.addEventListener("dragleave", () => dz.classList.remove("drag"));
+  dz.addEventListener("drop", (e) => {
+    e.preventDefault(); dz.classList.remove("drag");
+    if (e.dataTransfer.files.length) handleUpload(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener("change", () => { if (fileInput.files.length) handleUpload(fileInput.files[0]); });
+  el("fileClear").addEventListener("click", clearFile);
+
+  async function handleUpload(file){
+    setUploadingUI(file.name);
+    try{
+      const data = await uploadRequest(file);
+      const fid = data.file_id || data.id || data.fileId;
+      if (!fid) throw new Error("The server didn't return a file id.");
+      state.fileId = fid;
+      showFile(file.name, data);
+      enableAsk();
+    }catch(err){
+      clearFile();
+      showError("Couldn't load that file", err.message || "Upload failed. Check the file and try again.");
+    }
+  }
+
+  async function uploadRequest(file){
+    if (DEMO){
+      await wait(500);
+      return { file_id:"demo-file", rows:240, schema:[
+        {name:"order_id",type:"INTEGER"},{name:"category",type:"TEXT"},
+        {name:"product",type:"TEXT"},{name:"total_price",type:"REAL"},
+        {name:"quantity",type:"INTEGER"},{name:"order_date",type:"TEXT"}
+      ]};
+    }
+    const fd = new FormData();
+    fd.append("file", file);
+    const r = await fetch(API_BASE + "/upload", { method:"POST", body: fd });
+    if (!r.ok) throw new Error("Upload failed (" + r.status + ").");
+    return await r.json();
+  }
+
+  function setUploadingUI(name){
+    el("dataTag").textContent = "loading…";
+    el("fileName").textContent = name;
+    el("fileMeta").textContent = "reading…";
+    el("fileCard").classList.add("show");
+    dz.style.display = "none";
+  }
+
+  function showFile(name, data){
+    el("dataTag").textContent = "ready";
+    el("fileName").textContent = name;
+    const cols = extractColumns(data);
+    const rows = data.rows || data.row_count || (data.num_rows);
+    el("fileMeta").textContent = [
+      rows != null ? rows + " rows" : null,
+      cols.length ? cols.length + " columns" : null
+    ].filter(Boolean).join(" · ") || "loaded";
+    renderChips(cols);
+    renderSuggestions(data);
+    el("qualityWrap").style.display = "block";
+    resetCleanState();
+  }
+
+  function extractColumns(data){
+    // tolerate several shapes the /upload response might use
+    let raw = data.schema || data.columns || data.fields || data.column_types;
+    const out = [];
+    if (!raw) return out;
+    if (Array.isArray(raw)){
+      raw.forEach(c => {
+        if (typeof c === "string") out.push({name:c, type:""});
+        else if (Array.isArray(c)) out.push({name:String(c[0]||""), type:String(c[1]||"")});
+        else if (c && typeof c === "object") out.push({name:c.name||c.column||c.field||"", type:c.type||c.dtype||c.data_type||""});
+      });
+    } else if (typeof raw === "object"){
+      const vals = Object.values(raw);
+      if (vals.length && vals.every(v => Array.isArray(v))){
+        // backend shape: { tableName: [[col, type], ...] }
+        vals.forEach(colDefs => (colDefs || []).forEach(cd => {
+          if (Array.isArray(cd)) out.push({name:String(cd[0]||""), type:String(cd[1]||"")});
+          else if (typeof cd === "string") out.push({name:cd, type:""});
+          else if (cd && typeof cd === "object") out.push({name:cd.name||cd.column||"", type:cd.type||cd.dtype||""});
+        }));
+      } else {
+        // simple map: { colName: "TYPE" }
+        Object.keys(raw).forEach(k => out.push({name:k, type:String(raw[k]||"")}));
+      }
+    }
+    return out.filter(c => c.name);
+  }
+
+  function renderChips(cols){
+    const wrap = el("schemaWrap"), chips = el("chips");
+    if (!cols.length){ wrap.style.display = "none"; return; }
+    chips.innerHTML = "";
+    cols.forEach(c => {
+      const numeric = /int|real|float|double|numeric|decimal|number/i.test(c.type);
+      const chip = document.createElement("span");
+      chip.className = "chip" + (numeric ? "" : " txt");
+      chip.innerHTML = '<span class="g">' + (numeric ? "#" : "Aa") + '</span>' + escapeHtml(c.name);
+      chips.appendChild(chip);
+    });
+    wrap.style.display = "block";
+  }
+
+  /* ---------------- suggested questions (built from the uploaded schema) ---------------- */
+  function prettyName(n){ return String(n||"").replace(/_/g," ").trim(); }
+  function isNumericType(t){ return /int|real|float|double|numeric|decimal|number/i.test(t||""); }
+  function isIdName(n){ return /(^|_)id$/i.test(n) || /^id[_-]/i.test(n); }
+  function isDateName(n){ return /(date|time|_at$|year|month)/i.test(n); }
+
+  function parseTables(data){
+    const raw = data && (data.schema || data.columns || data.fields || data.column_types);
+    const norm = c => ({ name: c.name, type: c.type, numeric: isNumericType(c.type) });
+    if (raw && !Array.isArray(raw) && typeof raw === "object"){
+      const vals = Object.values(raw);
+      if (vals.length && vals.every(v => Array.isArray(v))){
+        // backend shape: { tableName: [[col, type], ...] } -> keep table names for nicer questions
+        return Object.keys(raw).map(t => ({
+          table: t,
+          cols: (raw[t] || []).map(cd =>
+              Array.isArray(cd) ? { name: String(cd[0] || ""), type: String(cd[1] || "") }
+            : (typeof cd === "string" ? { name: cd, type: "" }
+            : { name: (cd && (cd.name || cd.column)) || "", type: (cd && (cd.type || cd.dtype)) || "" }))
+            .filter(c => c.name).map(norm)
+        }));
+      }
+    }
+    return [{ table: null, cols: extractColumns(data).map(norm) }];
+  }
+
+  function buildSuggestions(data){
+    const tables = parseTables(data);
+    const ranks = [], groups = [], rels = [];
+    tables.forEach(t => {
+      const cols = t.cols || [];
+      const nums  = cols.filter(c => c.numeric && !isIdName(c.name));
+      const texts = cols.filter(c => !c.numeric && !isDateName(c.name) && !isIdName(c.name));
+      const hasName = cols.some(c => /^name$/i.test(c.name));
+      const CAT_RX = /(status|category|type|country|region|segment|group|department|state|city|tier|plan|gender|channel|source|priority)/i;
+      const cats = texts.filter(c => CAT_RX.test(c.name));
+      // ranking by a measure -> bar chart
+      if (nums.length){
+        const measure = nums[0];
+        if (t.table && hasName){
+          ranks.push("Which 10 " + t.table + " have the highest " + prettyName(measure.name) + "?");
+        } else {
+          const label = texts.find(c => !/^name$/i.test(c.name) && !CAT_RX.test(c.name));
+          if (label) ranks.push("What are the top 10 " + prettyName(label.name) + " by " + prettyName(measure.name) + "?");
+        }
+      }
+      // count grouped by a category -> pie chart
+      const cat = cats[0] || texts.find(c => !/^name$|first|last|email|phone|address/i.test(c.name));
+      if (cat){
+        const noun = t.table || "records";
+        groups.push("How many " + noun + " are there for each " + prettyName(cat.name) + "?");
+      }
+      // two measures -> scatter chart
+      if (nums.length >= 2){
+        rels.push("Is there a relationship between " + prettyName(nums[0].name) + " and " + prettyName(nums[1].name) + "?");
+      }
+    });
+    // interleave the three kinds so the top picks show variety
+    const out = [], pools = [ranks, groups, rels];
+    let i = 0;
+    while (out.length < 6 && pools.some(p => p.length)){
+      const p = pools[i % pools.length];
+      if (p.length){ const q = p.shift(); if (out.indexOf(q) === -1) out.push(q); }
+      i++;
+    }
+    return out;
+  }
+
+  function renderSuggestions(data){
+    const box = el("examples");
+    if (!box) return;
+    const qs = buildSuggestions(data);
+    box.innerHTML = qs.length
+      ? qs.map(q => '<button class="ex">' + escapeHtml(q) + '</button>').join("")
+      : DEFAULT_EXAMPLES;
+  }
+
+  function clearFile(){
+    state.fileId = null;
+    el("fileCard").classList.remove("show");
+    el("schemaWrap").style.display = "none";
+    el("qualityWrap").style.display = "none";
+    resetCleanState();
+    el("dataTag").textContent = "no file";
+    dz.style.display = "block";
+    fileInput.value = "";
+    const ex = el("examples"); if (ex) ex.innerHTML = DEFAULT_EXAMPLES;
+    disableAsk("Add a file to begin.");
+  }
+
+  /* ---------------- clean ---------------- */
+  el("cleanBtn").addEventListener("click", doClean);
+  el("downloadBtn").addEventListener("click", downloadCleaned);
+  el("useCleaned").addEventListener("change", () => {
+    el("dataTag").textContent = el("useCleaned").checked ? "cleaned" : "ready";
+  });
+
+  function resetCleanState(){
+    state.cleaned = false;
+    const box = el("cleanSummary");
+    box.classList.remove("show"); box.innerHTML = "";
+    el("cleanedWrap").style.display = "none";
+    el("downloadBtn").style.display = "none";
+    el("useCleaned").checked = false;
+    el("cleanBtn").disabled = false;
+    el("cleanBtn").querySelector(".cb-label").textContent = "Clean my data";
+  }
+
+  async function doClean(){
+    if (!state.fileId) return;
+    setCleaning(true);
+    try{
+      const data = await cleanRequest(state.fileId);
+      renderCleanSummary(data);
+      state.cleaned = true;
+      el("cleanedWrap").style.display = "flex";
+      el("downloadBtn").style.display = "inline-flex";
+      el("useCleaned").checked = true;          // default to using the cleaned copy
+      el("dataTag").textContent = "cleaned";
+    }catch(err){
+      renderCleanError(err.message || "Cleaning failed.");
+    }finally{
+      setCleaning(false);
+    }
+  }
+
+  async function cleanRequest(fileId){
+    if (DEMO){
+      await wait(750);
+      return { summary:"Cleaned a copy of your data. Your original file is untouched.",
+        changes:[
+          "Filled 4 missing values in ‘quantity’ with 0",
+          "Converted 6 text values in ‘total_price’ to numbers",
+          "Trimmed extra spaces from 3 category labels",
+          "Removed 1 fully-empty row"
+        ], fixed_count:14 };
+    }
+    const r = await fetch(API_BASE + "/clean", {
+      method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ file_id: fileId })
+    });
+    if (!r.ok) throw new Error("Clean failed (" + r.status + ").");
+    return await r.json();
+  }
+
+  function setCleaning(on){
+    const b = el("cleanBtn");
+    b.classList.toggle("loading", on);
+    b.disabled = on;
+    b.querySelector(".cb-label").textContent = on ? "Cleaning…" : (state.cleaned ? "Re-clean" : "Clean my data");
+  }
+
+  function renderCleanSummary(data){
+    const box = el("cleanSummary");
+    const parsed = parseCorrections(data);
+    const changes = parsed.lines;
+    const count = (data.fixed_count != null) ? data.fixed_count
+                : (data.fixes_count != null) ? data.fixes_count
+                : (data.num_changes != null) ? data.num_changes
+                : (parsed.count != null) ? parsed.count : changes.length;
+    let html = '<div class="cs-head">' +
+      '<svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M20 6L9 17l-5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+      escapeHtml(count ? ("Cleaned · " + count + (count === 1 ? " fix" : " fixes")) : "Cleaned") + '</div>';
+    if (changes.length){
+      html += '<ul>' + changes.slice(0,6).map(c => '<li>' + escapeHtml(c) + '</li>').join("") + '</ul>';
+      if (changes.length > 6) html += '<div class="cs-orig">+ ' + (changes.length - 6) + ' more</div>';
+    } else {
+      html += '<div class="cs-orig" style="color:var(--ink-2)">' + escapeHtml(data.summary || data.message || "No issues found — your data was already clean.") + '</div>';
+    }
+    html += '<div class="cs-orig">Your original file is untouched.</div>';
+    box.innerHTML = html;
+    box.classList.add("show");
+  }
+
+  function parseCorrections(data){
+    // Generic array shapes first (also used by the built-in demo)
+    let arr = data.changes || data.corrections || data.fixes || data.messages || data.tier2 || data.details;
+    if (Array.isArray(arr)){
+      const lines = arr.map(x => typeof x === "string" ? x
+        : (x && (x.message || x.description || x.detail || x.column)) || JSON.stringify(x));
+      return { lines, count: null };
+    }
+    // Real backend: correction_report = { table: {missing_filled, duplicates_removed,
+    //   categories_standardized, type_converted, ...} | {message: "No corrections needed"} }
+    const report = data.correction_report || data.report;
+    const lines = []; let count = 0;
+    if (report && typeof report === "object"){
+      const multi = Object.keys(report).length > 1;
+      for (const table of Object.keys(report)){
+        const log = report[table];
+        if (!log || typeof log !== "object" || log.message) continue;
+        const where = multi ? (" (" + table + ")") : "";
+        const mf = log.missing_filled || {};
+        for (const col of Object.keys(mf)){
+          const info = mf[col] || {};
+          const how = (info.filled_with === "median") ? "the median" : "‘Unknown’";
+          const n = info.count || 0;
+          lines.push("Filled " + n + " missing value" + (n === 1 ? "" : "s") + " in ‘" + col + "’ with " + how + where);
+          count += n;
+        }
+        if (log.duplicates_removed){
+          const n = log.duplicates_removed;
+          lines.push("Removed " + n + " duplicate row" + (n === 1 ? "" : "s") + where);
+          count += n;
+        }
+        const cs = log.categories_standardized || {};
+        for (const col of Object.keys(cs)){
+          const info = cs[col] || {};
+          const n = info.rows_updated || 0;
+          lines.push("Standardized " + n + " label" + (n === 1 ? "" : "s") + " in ‘" + col + "’ to ‘" + info.standardized_to + "’" + where);
+          count += n;
+        }
+        const tc = log.type_converted || {};
+        for (const col of Object.keys(tc)){
+          const info = tc[col] || {};
+          if (info.converted_count){
+            lines.push("Converted " + info.converted_count + " text value" + (info.converted_count === 1 ? "" : "s") + " in ‘" + col + "’ to numbers" + where);
+            count += info.converted_count;
+          }
+          if (info.unfixable_count){
+            lines.push("Couldn’t convert " + info.unfixable_count + " value" + (info.unfixable_count === 1 ? "" : "s") + " in ‘" + col + "’ (left unchanged)" + where);
+          }
+        }
+      }
+    }
+    return { lines, count: lines.length ? count : 0 };
+  }
+
+  function renderCleanError(msg){
+    const box = el("cleanSummary");
+    box.innerHTML = '<div class="cs-head" style="color:var(--danger)">Couldn’t clean the file</div>' +
+      '<div class="cs-orig" style="color:var(--ink-2)">' + escapeHtml(msg) + '</div>';
+    box.classList.add("show");
+  }
+
+  async function downloadCleaned(){
+    if (!state.fileId) return;
+    if (DEMO){ alert("Download will work once this page is served by your running server."); return; }
+    const btn = el("downloadBtn"), label = btn.querySelector(".dl-label");
+    const orig = label.textContent;
+    label.textContent = "Preparing…"; btn.disabled = true;
+    try{
+      const r = await fetch(API_BASE + "/download/" + encodeURIComponent(state.fileId));
+      if (!r.ok){
+        let msg = "Download failed (" + r.status + ").";
+        try{ const j = await r.json(); if (j && j.detail) msg = j.detail; }catch(e){}
+        throw new Error(msg);
+      }
+      const blob = await r.blob();
+      const name = filenameFromResponse(r) || "cleaned_data";
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+    }catch(err){
+      renderCleanError(err.message || "Couldn’t download the cleaned file.");
+    }finally{
+      label.textContent = orig; btn.disabled = false;
+    }
+  }
+
+  function filenameFromResponse(r){
+    const cd = r.headers.get("Content-Disposition") || "";
+    const m = /filename\*?=(?:UTF-8'')?["']?([^"';]+)/i.exec(cd);
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+
+  /* ---------------- custom colors ---------------- */
+  const DEFAULT_NEW = ["#0E7C66","#457B9D","#E9C46A","#E76F51","#264653"];
+  el("addColor").addEventListener("click", () => {
+    const next = DEFAULT_NEW[state.customColors.length % DEFAULT_NEW.length];
+    state.customColors.push(next);
+    renderColors();
+  });
+  el("resetColors").addEventListener("click", () => { state.customColors = []; renderColors(); });
+
+  function renderColors(){
+    const wrap = el("colors");
+    wrap.querySelectorAll(".swatch").forEach(s => s.remove());
+    const addBtn = el("addColor"), note = el("colorsNote"), reset = el("resetColors");
+    state.customColors.forEach((hex, i) => {
+      const s = document.createElement("span");
+      s.className = "swatch";
+      s.style.background = hex;
+      s.innerHTML = '<input type="color" value="'+hex+'" aria-label="Chart color '+(i+1)+'"><span class="x" title="Remove">×</span>';
+      s.querySelector("input").addEventListener("input", (e) => { state.customColors[i] = e.target.value; s.style.background = e.target.value; });
+      s.querySelector(".x").addEventListener("click", (e) => { e.stopPropagation(); state.customColors.splice(i,1); renderColors(); });
+      wrap.insertBefore(s, addBtn);
+    });
+    const has = state.customColors.length > 0;
+    note.style.display = has ? "none" : "inline";
+    reset.style.display = has ? "inline-flex" : "none";
+  }
+
+  /* ---------------- ask ---------------- */
+  el("examples").addEventListener("click", (e) => {
+    if (e.target.classList.contains("ex")){ el("question").value = e.target.textContent; el("question").focus(); }
+  });
+  el("askBtn").addEventListener("click", ask);
+  el("question").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) ask();
+  });
+
+  function enableAsk(){ el("askBtn").disabled = false; el("askHint").textContent = "Press Ask, or ⌘/Ctrl + Enter."; }
+  function disableAsk(msg){ el("askBtn").disabled = true; el("askHint").textContent = msg || ""; }
+
+  async function ask(){
+    const question = el("question").value.trim();
+    if (!state.fileId){ disableAsk("Add a file to begin."); return; }
+    if (!question){ el("question").focus(); return; }
+
+    setAsking(true);
+    showLoading();
+    const payload = {
+      file_id: state.fileId,
+      question,
+      use_cleaned: el("useCleaned").checked,
+      chart_theme: el("theme").value,
+      chart_type: document.querySelector('input[name="ctype"]:checked').value,
+      custom_colors: state.customColors.length ? state.customColors.slice() : null
+    };
+    try{
+      const data = await askRequest(payload);
+      if (data.error){ showError("SQLsentinel hit a problem", data.error); }
+      else { renderReport(data); }
+    }catch(err){
+      showError("Couldn't get an answer", err.message || "The request failed. Is the server running?");
+    }finally{
+      setAsking(false);
+    }
+  }
+
+  async function askRequest(payload){
+    if (DEMO){ await wait(900); return demoAnswer(payload); }
+    const r = await fetch(API_BASE + "/ask", {
+      method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(payload)
+    });
+    const data = await r.json().catch(() => { throw new Error("The server sent a response I couldn't read."); });
+    if (!r.ok && !data.error) throw new Error("Request failed (" + r.status + ").");
+    return data;
+  }
+
+  function setAsking(on){
+    const b = el("askBtn");
+    b.classList.toggle("loading", on);
+    b.disabled = on || !state.fileId;
+    b.querySelector(".ask-label").textContent = on ? "Reading your data…" : "Ask";
+  }
+
+  /* ---------------- render result ---------------- */
+  function showLoading(){
+    el("result").innerHTML =
+      '<div class="report"><div class="loadbar"></div>' +
+      '<div class="rail"></div><div class="report-body">' +
+      '<div class="r-eyebrow">Working</div>' +
+      '<p class="summary" style="color:var(--ink-2)">Writing SQL, running it against your data, and drawing the chart…</p>' +
+      '</div></div>';
+  }
+
+  function renderReport(d){
+    const rows = Array.isArray(d.table) ? d.table : [];
+    const cols = rows.length ? Object.keys(rows[0]) : [];
+
+    let html = '<div class="report"><div class="rail" id="rail"></div><div class="report-body">';
+
+    if (d.warning){
+      html += notice("warn", "Heads up", d.warning);
+    }
+
+    html += '<div class="r-eyebrow">Answer</div>';
+    html += '<p class="summary">' + escapeHtml(d.summary || "Here's what I found.") + '</p>';
+
+    if (d.chart_url){
+      const src = d.chart_url.startsWith("http") ? d.chart_url : (API_BASE + d.chart_url);
+      html += '<div class="figure"><img alt="Chart of the result" src="' + escapeAttr(src) + '" />';
+      html += '<div class="figcap">' + figPills(d) + '</div></div>';
+    }
+
+    if (rows.length){
+      html += '<div class="tbl-wrap"><table><thead><tr>';
+      cols.forEach(c => html += '<th>' + escapeHtml(c) + '</th>');
+      html += '</tr></thead><tbody>';
+      rows.forEach(row => {
+        html += '<tr>';
+        cols.forEach(c => {
+          const v = row[c];
+          const num = typeof v === "number";
+          html += '<td class="' + (num ? "num" : "") + '">' + escapeHtml(fmt(v)) + '</td>';
+        });
+        html += '</tr>';
+      });
+      html += '</tbody></table></div>';
+    }
+
+    if (d.sql_used){
+      html += '<details class="disclosure"><summary>' +
+        '<svg class="chev" width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M4 2l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+        'How I worked this out</summary><div class="body">' +
+        '<pre class="sql">' + highlightSql(d.sql_used) + '</pre>' +
+        '<div class="meta-grid">' + metaPills(d) + '</div>' +
+        '</div></details>';
+    }
+
+    html += '</div></div>';
+    el("result").innerHTML = html;
+    drawRailTicks();
+  }
+
+  function figPills(d){
+    let p = "";
+    if (d.chart_type_used) p += '<span class="pill">type · ' + escapeHtml(d.chart_type_used) + '</span>';
+    if (d.chart_theme_used) p += '<span class="pill">theme · ' + escapeHtml(d.chart_theme_used) + '</span>';
+    if (d.custom_colors_used && d.custom_colors_used.length) p += '<span class="pill on">custom colors · ' + d.custom_colors_used.length + '</span>';
+    return p;
+  }
+  function metaPills(d){
+    let p = "";
+    if (d.outcome) p += '<span class="pill">outcome · ' + escapeHtml(d.outcome) + '</span>';
+    if (d.chart_type_used) p += '<span class="pill">chart · ' + escapeHtml(d.chart_type_used) + '</span>';
+    if (d.custom_colors_used && d.custom_colors_used.length){
+      d.custom_colors_used.forEach(c => p += '<span class="pill"><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:'+escapeAttr(c)+';margin-right:5px;vertical-align:-1px;"></span>'+escapeHtml(c)+'</span>');
+    }
+    return p;
+  }
+
+  function drawRailTicks(){
+    const rail = document.getElementById("rail");
+    if (!rail) return;
+    const h = rail.clientHeight, top = 22, bottom = 22, n = 5;
+    for (let i=0;i<n;i++){
+      const t = document.createElement("span");
+      t.className = "tick";
+      t.style.top = (top + i * ((h - top - bottom) / (n - 1))) + "px";
+      rail.appendChild(t);
+    }
+  }
+
+  function showError(title, msg){
+    el("result").innerHTML =
+      '<div class="report"><div class="rail"></div><div class="report-body">' +
+      notice("err", title, msg) +
+      '<p class="summary" style="color:var(--ink-2);margin:0;">Adjust your question or file and try again.</p>' +
+      '</div></div>';
+  }
+
+  function notice(kind, title, msg){
+    const icon = kind === "err"
+      ? '<path d="M12 8v5m0 3h.01M10.3 3.9L2.4 18a2 2 0 001.7 3h15.8a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'
+      : '<path d="M12 9v4m0 3h.01M12 3a9 9 0 100 18 9 9 0 000-18z" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>';
+    return '<div class="notice ' + kind + '">' +
+      '<svg class="ni" width="18" height="18" viewBox="0 0 24 24" fill="none">' + icon + '</svg>' +
+      '<div><span class="nt">' + escapeHtml(title) + '</span> — ' + escapeHtml(msg) + '</div></div>';
+  }
+
+  /* ---------------- helpers ---------------- */
+  function fmt(v){
+    if (v === null || v === undefined) return "—";
+    if (typeof v === "number"){
+      if (Number.isInteger(v)) return v.toLocaleString();
+      return v.toLocaleString(undefined, { maximumFractionDigits: 2 });
+    }
+    return String(v);
+  }
+  function highlightSql(sql){
+    const kws = ["SELECT","FROM","WHERE","GROUP BY","ORDER BY","HAVING","JOIN","LEFT JOIN","INNER JOIN","ON","AS","LIMIT","SUM","COUNT","AVG","MIN","MAX","DESC","ASC","AND","OR","DISTINCT","BETWEEN","LIKE"];
+    let out = escapeHtml(sql);
+    kws.forEach(k => { out = out.replace(new RegExp("\\b(" + k.replace(" ","\\s+") + ")\\b","gi"), '<span class="kw">$1</span>'); });
+    return out;
+  }
+  function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+  function escapeAttr(s){ return escapeHtml(s); }
+  function wait(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+  /* ---------------- demo answer ---------------- */
+  function demoAnswer(payload){
+    const cats = ["Apparel","Electronics","Fitness","Kitchen","Office"];
+    const vals = [5125.0, 15296.8, 16693.5, 8936.0, 3926.4];
+    const palette = (payload.custom_colors && payload.custom_colors.length)
+      ? payload.custom_colors
+      : ["#3E6E8E","#5B8AA6","#7BA6BE","#9CC0D3","#C2DCE8"];
+    return {
+      summary: "Fitness leads with $16,693.50 in total revenue, just ahead of Electronics at $15,296.80. Together those two categories make up more than half of all sales, while Office trails at $3,926.40.",
+      table: cats.map((c,i) => ({ category:c, "SUM(total_price)": vals[i] })),
+      chart_url: demoChart(cats, vals, palette),
+      sql_used: "SELECT T1.category, SUM(T2.total_price)\nFROM products AS T1\nJOIN orders AS T2 ON T1.product_id = T2.product_id\nGROUP BY T1.category\nORDER BY SUM(T2.total_price) DESC",
+      chart_type_used: payload.chart_type === "auto" ? "bar" : payload.chart_type,
+      chart_theme_used: payload.chart_theme,
+      custom_colors_used: (payload.custom_colors && payload.custom_colors.length) ? payload.custom_colors : null,
+      warning: payload.chart_type === "scatter" ? "Data does not support scatter chart (need >= 2 numeric columns); showing a bar chart instead." : null,
+      outcome: "success"
+    };
+  }
+  function demoChart(cats, vals, colors){
+    const W=760,H=430,pad=64, max=Math.max(...vals)*1.12;
+    const bw=(W-pad*2)/cats.length*0.62, gap=(W-pad*2)/cats.length;
+    let bars="", labels="";
+    cats.forEach((c,i)=>{
+      const x=pad + i*gap + (gap-bw)/2;
+      const h=(vals[i]/max)*(H-pad*2);
+      const y=H-pad-h;
+      bars+='<rect x="'+x.toFixed(1)+'" y="'+y.toFixed(1)+'" width="'+bw.toFixed(1)+'" height="'+h.toFixed(1)+'" fill="'+colors[i%colors.length]+'" rx="2"/>';
+      bars+='<text x="'+(x+bw/2).toFixed(1)+'" y="'+(y-8).toFixed(1)+'" font-family="IBM Plex Mono,monospace" font-size="12" fill="#47566A" text-anchor="middle">'+vals[i].toLocaleString()+'</text>';
+      labels+='<text x="'+(x+bw/2).toFixed(1)+'" y="'+(H-pad+20)+'" font-family="IBM Plex Sans,sans-serif" font-size="13" fill="#14202C" text-anchor="middle">'+c+'</text>';
+    });
+    const svg='<svg xmlns="http://www.w3.org/2000/svg" width="'+W+'" height="'+H+'" viewBox="0 0 '+W+' '+H+'">'
+      +'<rect width="'+W+'" height="'+H+'" fill="#FFFFFF"/>'
+      +'<text x="'+pad+'" y="34" font-family="Space Grotesk,sans-serif" font-weight="600" font-size="16" fill="#14202C">Total revenue by product category</text>'
+      +'<line x1="'+pad+'" y1="'+(H-pad)+'" x2="'+(W-pad)+'" y2="'+(H-pad)+'" stroke="#CDD6E0" stroke-width="1.2"/>'
+      +'<line x1="'+pad+'" y1="'+pad+'" x2="'+pad+'" y2="'+(H-pad)+'" stroke="#CDD6E0" stroke-width="1.2"/>'
+      +bars+labels+'</svg>';
+    return "data:image/svg+xml;utf8," + encodeURIComponent(svg);
+  }
+
+  /* ---------------- boot ---------------- */
+  el("footer").textContent = DEMO
+    ? "SQLsentinel · preview mode — open without ?demo=1 once served by your API to go live."
+    : "SQLsentinel · connected to your SQL agent on this server.";
+  renderColors();
+  checkHealth();
+  if (DEMO){
+    // preload a demo file + run one sample question so the whole design shows
+    el("question").value = "What is the total revenue by product category?";
+    handleUpload({ name:"sales_2025.csv" }).then(() => doClean()).then(() => ask());
+  }
+})();
+</script>
+</body>
+</html>
