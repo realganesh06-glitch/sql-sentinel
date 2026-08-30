@@ -11,7 +11,6 @@ from fastapi.responses import FileResponse, JSONResponse
 from matplotlib.colors import is_color_like
 
 import agent
-import eval_suite
 from agent import is_numeric
 from pydantic import BaseModel
 
@@ -69,11 +68,6 @@ class AskResponse(BaseModel):
     chart_type_used: Optional[str] = None
     custom_colors_used: Optional[List[str]] = None
     warning: Optional[str] = None
-
-
-class ReportCardRequest(BaseModel):
-    file_id: str
-    use_cleaned: bool = False
 
 
 def _get_api_key() -> str:
@@ -409,25 +403,6 @@ async def ask_question(request: AskRequest):
     api_key = _get_api_key()
     result = _run_question_answering(request.file_id, request.question, request.use_cleaned, api_key, request.chart_theme, request.chart_type, request.custom_colors)
     return AskResponse(**result)
-
-
-@app.post("/report_card")
-async def report_card(request: ReportCardRequest):
-    """Run the accuracy benchmark against the loaded dataset and return a scorecard."""
-    api_key = _get_api_key()
-    file_info = file_store.get(request.file_id)
-    if not file_info:
-        raise HTTPException(status_code=404, detail=f"File ID {request.file_id} not found")
-    if request.use_cleaned:
-        conn = file_info.get("cleaned_conn") or file_info["original_conn"]
-    else:
-        conn = file_info["original_conn"]
-    if conn is None:
-        raise HTTPException(status_code=400, detail="Connection not available for this file")
-    try:
-        return eval_suite.run_report_card(conn, api_key)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Report card failed: {e}")
 
 
 @app.get("/charts/{filename}")
